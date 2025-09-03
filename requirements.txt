@@ -23,7 +23,11 @@ JPype1==1.2.1
 kiwisolver==1.3.1
 Markdown==3.3.4
 matplotlib==3.4.1
-numpy==1.19.2
+
+# 250903 수정
+# numpy==1.19.2
+numpy==1.19.5
+
 oauthlib==3.1.0
 pandas==1.2.3
 pathtools==0.1.2
@@ -49,7 +53,10 @@ shortuuid==1.0.1
 six==1.15.0
 smmap==4.0.0
 stable-baselines3==1.0
-subprocess32==3.5.4
+
+# 250903 수정
+# subprocess32==3.5.4
+
 tensorboard==2.4.1
 tensorboard-plugin-wit==1.8.0
 torch==1.8.0
@@ -61,3 +68,6 @@ typing-extensions==3.7.4.3
 urllib3==1.26.4
 wandb==0.10.24
 Werkzeug==1.0.1
+
+# 250903 
+pyvirtualdisplay

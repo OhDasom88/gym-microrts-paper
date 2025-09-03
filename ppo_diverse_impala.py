@@ -1,3 +1,8 @@
+
+from pyvirtualdisplay import Display
+display = Display(visible=0, size=(1400, 900))
+display.start()
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
