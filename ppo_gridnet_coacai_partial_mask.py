@@ -1,5 +1,19 @@
-# http://proceedings.mlr.press/v97/han19a/han19a.pdf
+"""
+PPO GridNet CoacAI Partial Mask 에이전트 훈련 스크립트
 
+이 스크립트는 GridNet 아키텍처를 사용하여 CoacAI와 대전하는 PPO 에이전트를 훈련합니다.
+부분적 액션 마스킹을 사용하여 액션 파라미터에 대한 마스킹을 제거합니다.
+
+주요 특징:
+- GridNet 아키텍처 (각 그리드 셀에 대해 액션 예측)
+- CoacAI와의 대전
+- 부분적 액션 마스킹 (액션 파라미터 마스킹 제거)
+- 16x16 그리드 기반 액션 공간
+
+참고 논문: http://proceedings.mlr.press/v97/han19a/han19a.pdf
+"""
+
+# PyTorch 관련 라이브러리
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -7,6 +21,7 @@ import torch.nn.functional as F
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
 
+# 기타 유틸리티 라이브러리
 import argparse
 from distutils.util import strtobool
 import numpy as np
@@ -92,69 +107,87 @@ args.num_envs = args.num_selfplay_envs + args.num_bot_envs
 args.batch_size = int(args.num_envs * args.num_steps)
 args.minibatch_size = int(args.batch_size // args.n_minibatch)
 
+# ==================== 환경 래퍼 클래스들 ====================
+
+# 에피소드 모니터링을 위한 벡터화된 환경 래퍼
 class VecMonitor(VecEnvWrapper):
     def __init__(self, venv):
         VecEnvWrapper.__init__(self, venv)
-        self.eprets = None
-        self.eplens = None
-        self.epcount = 0
-        self.tstart = time.time()
+        self.eprets = None  # 에피소드별 누적 보상
+        self.eplens = None  # 에피소드별 길이
+        self.epcount = 0    # 총 에피소드 수
+        self.tstart = time.time()  # 시작 시간
 
     def reset(self):
+        """환경 리셋 및 에피소드 통계 초기화"""
         obs = self.venv.reset()
-        self.eprets = np.zeros(self.num_envs, 'f')
-        self.eplens = np.zeros(self.num_envs, 'i')
+        self.eprets = np.zeros(self.num_envs, 'f')  # 부동소수점 배열
+        self.eplens = np.zeros(self.num_envs, 'i')  # 정수 배열
         return obs
 
     def step_wait(self):
+        """스텝 실행 및 에피소드 완료 시 통계 기록"""
         obs, rews, dones, infos = self.venv.step_wait()
-        self.eprets += rews
-        self.eplens += 1
+        self.eprets += rews  # 누적 보상 업데이트
+        self.eplens += 1     # 에피소드 길이 증가
 
         newinfos = list(infos[:])
         for i in range(len(dones)):
-            if dones[i]:
+            if dones[i]:  # 에피소드가 완료된 경우
                 info = infos[i].copy()
                 ret = self.eprets[i]
                 eplen = self.eplens[i]
+                # 에피소드 정보 생성 (보상, 길이, 시간)
                 epinfo = {'r': ret, 'l': eplen, 't': round(time.time() - self.tstart, 6)}
                 info['episode'] = epinfo
                 self.epcount += 1
+                # 완료된 에피소드 통계 리셋
                 self.eprets[i] = 0
                 self.eplens[i] = 0
                 newinfos[i] = info
         return obs, rews, dones, newinfos
 
+# MicroRTS 통계 기록을 위한 벡터화된 환경 래퍼
 class MicroRTSStatsRecorder(VecEnvWrapper):
     def __init__(self, env, gamma):
         super().__init__(env)
         self.gamma = gamma
 
     def reset(self):
+        """환경 리셋 및 원시 보상 기록 초기화"""
         obs = self.venv.reset()
-        self.raw_rewards = [[] for _ in range(self.num_envs)]
+        self.raw_rewards = [[] for _ in range(self.num_envs)]  # 환경별 원시 보상 리스트
         return obs
 
     def step_wait(self):
+        """스텝 실행 및 원시 보상 수집, 에피소드 완료 시 통계 계산"""
         obs, rews, dones, infos = self.venv.step_wait()
+        
+        # 각 환경의 원시 보상 수집
         for i in range(len(dones)):
             self.raw_rewards[i] += [infos[i]["raw_rewards"]] 
+        
         newinfos = list(infos[:])
         for i in range(len(dones)):
-            if dones[i]:
+            if dones[i]:  # 에피소드가 완료된 경우
                 info = infos[i].copy()
+                # 에피소드 동안의 모든 원시 보상 합계 계산
                 raw_rewards = np.array(self.raw_rewards[i]).sum(0)
-                raw_names = [str(rf) for rf in self.rfs]
+                raw_names = [str(rf) for rf in self.rfs]  # 보상 함수 이름들
+                # MicroRTS 통계를 딕셔너리로 저장
                 info['microrts_stats'] = dict(zip(raw_names, raw_rewards))
-                self.raw_rewards[i] = []
+                self.raw_rewards[i] = []  # 완료된 에피소드의 원시 보상 리셋
                 newinfos[i] = info
         return obs, rews, dones, newinfos
 
-# TRY NOT TO MODIFY: setup the environment
+# ==================== 환경 설정 및 로깅 초기화 ====================
 experiment_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
 writer = SummaryWriter(f"runs/{experiment_name}")
+# 하이퍼파라미터를 텍스트로 기록
 writer.add_text('hyperparameters', "|param|value|\n|-|-|\n%s" % (
         '\n'.join([f"|{key}|{value}|" for key, value in vars(args).items()])))
+
+# 프로덕션 모드에서 wandb 초기화
 if args.prod_mode:
     import wandb
     run = wandb.init(
@@ -165,51 +198,62 @@ if args.prod_mode:
     writer = SummaryWriter(f"/tmp/{experiment_name}")
     CHECKPOINT_FREQUENCY = 50
 
-# TRY NOT TO MODIFY: seeding
+# ==================== 재현 가능한 결과를 위한 시드 설정 ====================
 device = torch.device('cuda' if torch.cuda.is_available() and args.cuda else 'cpu')
 random.seed(args.seed)
 np.random.seed(args.seed)
 torch.manual_seed(args.seed)
 torch.backends.cudnn.deterministic = args.torch_deterministic
+
+# ==================== MicroRTS GridMode 환경 생성 ====================
+# CoacAI와의 대전을 위한 GridMode 환경 설정
 envs = MicroRTSGridModeVecEnv(
-    num_selfplay_envs=args.num_selfplay_envs,
-    num_bot_envs=args.num_bot_envs,
-    max_steps=2000,
-    render_theme=2,
-    ai2s=[microrts_ai.coacAI for _ in range(args.num_bot_envs)],
-    map_path="maps/16x16/basesWorkers16x16.xml",
-    reward_weight=np.array([10.0, 1.0, 1.0, 0.2, 1.0, 4.0])
+    num_selfplay_envs=args.num_selfplay_envs,  # 셀프플레이 환경 수
+    num_bot_envs=args.num_bot_envs,            # 봇 환경 수
+    max_steps=2000,                           # 최대 게임 스텝 수
+    render_theme=2,                           # 렌더링 테마
+    ai2s=[microrts_ai.coacAI for _ in range(args.num_bot_envs)],  # CoacAI 사용
+    map_path="maps/16x16/basesWorkers16x16.xml",  # 16x16 맵
+    reward_weight=np.array([10.0, 1.0, 1.0, 0.2, 1.0, 4.0])  # 보상 가중치
 )
-envs = MicroRTSStatsRecorder(envs, args.gamma)
-envs = VecMonitor(envs)
+
+# 환경 래퍼 추가
+envs = MicroRTSStatsRecorder(envs, args.gamma)  # MicroRTS 통계 기록
+envs = VecMonitor(envs)                        # 에피소드 모니터링
+
+# 비디오 녹화 설정
 if args.capture_video:
     envs = VecVideoRecorder(envs, f'videos/{experiment_name}',
                             record_video_trigger=lambda x: x % 1000000 == 0, video_length=2000)
-# if args.prod_mode:
-#     envs = VecPyTorch(
-#         SubprocVecEnv([make_env(args.gym_id, args.seed+i, i) for i in range(args.num_envs)], "fork"),
-#         device
-#     )
+
+# 액션 공간 검증
 assert isinstance(envs.action_space, MultiDiscrete), "only MultiDiscrete action space is supported"
 
-# ALGO LOGIC: initialize agent here:
+# ==================== 에이전트 아키텍처 정의 ====================
+
+# 마스크된 카테고리컬 분포 클래스 (유효하지 않은 액션을 마스킹)
 class CategoricalMasked(Categorical):
     def __init__(self, probs=None, logits=None, validate_args=None, masks=[], sw=None):
         self.masks = masks
         if len(self.masks) == 0:
+            # 마스크가 없는 경우 일반 카테고리컬 분포 사용
             super(CategoricalMasked, self).__init__(probs, logits, validate_args)
         else:
+            # 마스크가 있는 경우 유효하지 않은 액션의 로짓을 매우 작은 값으로 설정
             self.masks = masks.bool()
             logits = torch.where(self.masks, logits, torch.tensor(-1e+8, device=device))
             super(CategoricalMasked, self).__init__(probs, logits, validate_args)
     
     def entropy(self):
+        """마스크를 고려한 엔트로피 계산"""
         if len(self.masks) == 0:
             return super(CategoricalMasked, self).entropy()
+        # 마스크된 액션은 엔트로피 계산에서 제외
         p_log_p = self.logits * self.probs
         p_log_p = torch.where(self.masks, p_log_p, torch.tensor(0.).to(device))
         return -p_log_p.sum(-1)
 
+# 스케일링 레이어 (값에 상수를 곱함)
 class Scale(nn.Module):
     def __init__(self, scale):
         super().__init__()
@@ -218,6 +262,7 @@ class Scale(nn.Module):
     def forward(self, x):
         return x * self.scale
 
+# 텐서 차원 순서 변경 레이어
 class Transpose(nn.Module):
     def __init__(self, permutation):
         super().__init__()
@@ -226,39 +271,64 @@ class Transpose(nn.Module):
     def forward(self, x):
         return x.permute(self.permutation)
 
+# 레이어 초기화 함수 (직교 초기화 사용)
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
+# PPO GridNet 에이전트 클래스 (부분적 마스킹)
 class Agent(nn.Module):
     def __init__(self, mapsize=16*16):
         super(Agent, self).__init__()
-        self.mapsize = mapsize
+        self.mapsize = mapsize  # 16x16 = 256 그리드 셀
+        
+        # 공유 네트워크 (CNN 기반 특징 추출)
         self.network = nn.Sequential(
-            layer_init(nn.Conv2d(27, 16, kernel_size=3, stride=2)),
+            layer_init(nn.Conv2d(27, 16, kernel_size=3, stride=2)),  # 첫 번째 컨볼루션
             nn.ReLU(),
-            layer_init(nn.Conv2d(16, 32, kernel_size=2)),
+            layer_init(nn.Conv2d(16, 32, kernel_size=2)),            # 두 번째 컨볼루션
             nn.ReLU(),
-            nn.Flatten(),
-            layer_init(nn.Linear(32*6*6, 256)),
-            nn.ReLU(),)
+            nn.Flatten(),                                            # 평면화
+            layer_init(nn.Linear(32*6*6, 256)),                     # 완전연결층
+            nn.ReLU(),
+        )
+        # 액터 헤드 (정책 네트워크) - 각 그리드 셀에 대해 액션 예측
         self.actor = layer_init(nn.Linear(256, self.mapsize*envs.action_space.nvec[1:].sum()), std=0.01)
+        # 크리틱 헤드 (가치 네트워크)
         self.critic = layer_init(nn.Linear(256, 1), std=1)
 
     def forward(self, x):
-        return self.network(x.permute((0, 3, 1, 2))) # "bhwc" -> "bchw"
+        """네트워크 순전파 (차원 순서 변경: "bhwc" -> "bchw")"""
+        return self.network(x.permute((0, 3, 1, 2)))
 
     def get_action(self, x, action=None, invalid_action_masks=None, envs=None):
+        """
+        액션 선택 및 로그 확률, 엔트로피 계산 (부분적 마스킹)
+        
+        Args:
+            x: 관찰값
+            action: 미리 선택된 액션 (None이면 새로 샘플링)
+            invalid_action_masks: 유효하지 않은 액션 마스크
+            envs: 환경 객체
+            
+        Returns:
+            action: 선택된 액션
+            logprob: 로그 확률
+            entropy: 엔트로피
+            invalid_action_masks: 액션 마스크
+        """
         logits = self.actor(self.forward(x))
         grid_logits = logits.view(-1, envs.action_space.nvec[1:].sum())
         split_logits = torch.split(grid_logits, envs.action_space.nvec[1:].tolist(), dim=1)
         
         if action is None:
+            # 액션 마스크 가져오기
             invalid_action_masks = torch.tensor(np.array(envs.vec_client.getMasks(0))).to(device)
             invalid_action_masks = invalid_action_masks.view(-1,invalid_action_masks.shape[-1])
             
-            # remove the mask on action parameters, which is a similar setup to pysc2
+            # 액션 파라미터에 대한 마스크 제거 (pysc2와 유사한 설정)
+            # 인덱스 6부터는 액션 파라미터이므로 마스킹을 제거
             invalid_action_masks[:,6:] = 1
             
             split_invalid_action_masks = torch.split(invalid_action_masks[:,1:], envs.action_space.nvec[1:].tolist(), dim=1)
@@ -269,16 +339,22 @@ class Agent(nn.Module):
             action = action.view(-1,action.shape[-1]).T
             split_invalid_action_masks = torch.split(invalid_action_masks[:,1:], envs.action_space.nvec[1:].tolist(), dim=1)
             multi_categoricals = [CategoricalMasked(logits=logits, masks=iam) for (logits, iam) in zip(split_logits, split_invalid_action_masks)]
+        
+        # 로그 확률과 엔트로피 계산
         logprob = torch.stack([categorical.log_prob(a) for a, categorical in zip(action, multi_categoricals)])
         entropy = torch.stack([categorical.entropy() for categorical in multi_categoricals])
         num_predicted_parameters = len(envs.action_space.nvec) - 1
+        
+        # 그리드 형태로 재구성 (256x7 형태)
         logprob = logprob.T.view(-1, 256, num_predicted_parameters)
         entropy = entropy.T.view(-1, 256, num_predicted_parameters)
         action = action.T.view(-1, 256, num_predicted_parameters)
         invalid_action_masks = invalid_action_masks.view(-1, 256, envs.action_space.nvec[1:].sum()+1)
+        
         return action, logprob.sum(1).sum(1), entropy.sum(1).sum(1), invalid_action_masks
 
     def get_value(self, x):
+        """상태 가치 예측"""
         return self.critic(self.forward(x))
 
 agent = Agent().to(device)

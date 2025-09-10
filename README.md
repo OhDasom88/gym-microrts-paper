@@ -9,11 +9,18 @@ This repo contains the code for the paper [Gym-μRTS: Toward Affordable Deep Rei
 Make sure you have `ffmpeg` and `jdk>=1.8.0` installed. Then install the dependencies:
 
 ```bash
+sudo apt update && sudo apt install ffmpeg -y
+sudo apt-get install -y xvfb x11vnc python3-opengl
+sudo apt-get install -y libxext-dev libxrender1 libxtst6 libxi6
+# sudo apt-get install -y openjdk-11-jdk
+
 git clone https://github.com/vwxyzjn/gym-microrts-paper
 cd gym-microrts-paper
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
+pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchtext==0.13.1 -f https://download.pytorch.org/whl/torch_stable.html
 ```
 
 ## Reproduce and plot results
@@ -103,7 +110,8 @@ You can enable this feature by toggling the `--prod-mode` tag with the scripts a
 For example, try running
 
 ```
-python ppo_diverse_impala.py --capture-video --prod-mode --wandb-project gym-microrts-paper
+<!-- python ppo_diverse_impala.py --capture-video --prod-mode --wandb-project gym-microrts-paper -->
+python ppo_diverse_impala.py --capture-video --prod-mode --wandb-project defense2vec_simulation
 ```
 
 and you should see ouputs similar to the following
